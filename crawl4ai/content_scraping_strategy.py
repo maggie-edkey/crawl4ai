@@ -1,34 +1,32 @@
+import copy
 import re
-from itertools import chain
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
-from bs4 import BeautifulSoup
-import asyncio
-import requests
-from .config import (
-    MIN_WORD_THRESHOLD,
-    IMAGE_DESCRIPTION_MIN_WORD_THRESHOLD,
-    IMAGE_SCORE_THRESHOLD,
-    ONLY_TEXT_ELIGIBLE_TAGS,
-    IMPORTANT_ATTRS,
-    SOCIAL_MEDIA_DOMAINS,
-)
-from bs4 import NavigableString, Comment
-from bs4 import PageElement, Tag
+from itertools import chain
+from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
-from requests.exceptions import InvalidSchema
-from .utils import (
-    extract_metadata,
-    normalize_url,
-    is_external_url,
-    get_base_domain,
-    extract_metadata_using_lxml,
-)
+
+import requests
+from bs4 import BeautifulSoup, Comment, NavigableString, PageElement, Tag
 from lxml import etree
 from lxml import html as lhtml
-from typing import List
-from .models import ScrapingResult, MediaItem, Link, Media, Links
-import copy
+from requests.exceptions import InvalidSchema
+
+from .config import (
+    IMAGE_DESCRIPTION_MIN_WORD_THRESHOLD,
+    IMAGE_SCORE_THRESHOLD,
+    IMPORTANT_ATTRS,
+    MIN_WORD_THRESHOLD,
+    ONLY_TEXT_ELIGIBLE_TAGS,
+    SOCIAL_MEDIA_DOMAINS,
+)
+from .models import Link, Links, Media, MediaItem, ScrapingResult
+from .utils import (
+    extract_metadata,
+    extract_metadata_using_lxml,
+    get_base_domain,
+    is_external_url,
+    normalize_url,
+)
 
 # Pre-compile regular expressions for Open Graph and Twitter metadata
 OG_REGEX = re.compile(r"^og:")
@@ -110,6 +108,9 @@ class WebScrapingStrategy(ContentScrapingStrategy):
 
     def __init__(self, logger=None):
         self.logger = logger
+        # 预编译正则表达式以提高性能并减少内存使用
+        self.BASE64_PATTERN = re.compile(r'data:image/[^;]+;base64,([^"]+)')
+        self.DIMENSION_REGEX = re.compile(r"(\d+)(\D*)")
 
     def _log(self, level, message, tag="SCRAPE", **kwargs):
         """Helper method to safely use logger."""
@@ -208,7 +209,7 @@ class WebScrapingStrategy(ContentScrapingStrategy):
             bool: True if the table is a data table, False otherwise
         """
         score = 0
-        
+
         # Check for thead and tbody
         has_thead = len(table.select('thead')) > 0
         has_tbody = len(table.select('tbody')) > 0
@@ -216,40 +217,40 @@ class WebScrapingStrategy(ContentScrapingStrategy):
             score += 2
         if has_tbody:
             score += 1
-            
+
         # Check for th elements
         th_count = len(table.select('th'))
         if th_count > 0:
             score += 2
             if has_thead or len(table.select('tr:first-child th')) > 0:
                 score += 1
-                
+
         # Check for nested tables
         if len(table.select('table')) > 0:
             score -= 3
-            
+
         # Role attribute check
         role = table.get('role', '').lower()
         if role in {'presentation', 'none'}:
             score -= 3
-            
+
         # Column consistency
         rows = table.select('tr')
         if not rows:
             return False
-            
+
         col_counts = [len(row.select('td, th')) for row in rows]
         avg_cols = sum(col_counts) / len(col_counts)
         variance = sum((c - avg_cols)**2 for c in col_counts) / len(col_counts)
         if variance < 1:
             score += 2
-            
+
         # Caption and summary
         if table.select('caption'):
             score += 2
         if table.has_attr('summary') and table['summary']:
             score += 1
-            
+
         # Text density
         total_text = sum(len(cell.get_text().strip()) for row in rows for cell in row.select('td, th'))
         total_tags = sum(1 for _ in table.descendants if isinstance(_, Tag))
@@ -258,18 +259,18 @@ class WebScrapingStrategy(ContentScrapingStrategy):
             score += 3
         elif text_ratio > 10:
             score += 2
-            
+
         # Data attributes
         data_attrs = sum(1 for attr in table.attrs if attr.startswith('data-'))
         score += data_attrs * 0.5
-        
+
         # Size check
         if avg_cols >= 2 and len(rows) >= 2:
             score += 2
-            
+
         threshold = kwargs.get('table_score_threshold', 7)
         return score >= threshold
-    
+
     def extract_table_data(self, table: Tag) -> dict:
         """
         Extract structured data from a table element.
@@ -283,7 +284,7 @@ class WebScrapingStrategy(ContentScrapingStrategy):
         caption_elem = table.select_one('caption')
         caption = caption_elem.get_text().strip() if caption_elem else ""
         summary = table.get('summary', '').strip()
-        
+
         # Extract headers with colspan handling
         headers = []
         thead_rows = table.select('thead tr')
@@ -300,7 +301,7 @@ class WebScrapingStrategy(ContentScrapingStrategy):
                     text = cell.get_text().strip()
                     colspan = int(cell.get('colspan', 1))
                     headers.extend([text] * colspan)
-        
+
         # Extract rows with colspan handling
         rows = []
         all_rows = table.select('tr')
@@ -315,9 +316,9 @@ class WebScrapingStrategy(ContentScrapingStrategy):
                 tbody_rows = all_rows[1:]
             else:
                 tbody_rows = all_rows
-                
+
         for row in tbody_rows:        
-        # for row in table.select('tr:not(:has(ancestor::thead))'):
+            # for row in table.select('tr:not(:has(ancestor::thead))'):
             row_data = []
             for cell in row.select('td'):
                 text = cell.get_text().strip()
@@ -325,24 +326,24 @@ class WebScrapingStrategy(ContentScrapingStrategy):
                 row_data.extend([text] * colspan)
             if row_data:
                 rows.append(row_data)
-                
+
         # Align rows with headers
         max_columns = len(headers) if headers else (max(len(row) for row in rows) if rows else 0)
         aligned_rows = []
         for row in rows:
             aligned = row[:max_columns] + [''] * (max_columns - len(row))
             aligned_rows.append(aligned)
-            
+
         if not headers:
             headers = [f"Column {i+1}" for i in range(max_columns)]
-            
+
         return {
             "headers": headers,
             "rows": aligned_rows,
             "caption": caption,
             "summary": summary,
         }
-    
+
     def flatten_nested_elements(self, node):
         """
         Flatten nested elements in a HTML tree.
@@ -862,166 +863,196 @@ class WebScrapingStrategy(ContentScrapingStrategy):
             return None
 
         parser_type = kwargs.get("parser", "lxml")
-        soup = BeautifulSoup(html, parser_type)
-        body = soup.body
-        if body is None:
-            raise Exception("'<body>' tag is not found in fetched html. Consider adding wait_for=\"css:body\" to wait for body tag to be loaded into DOM.")
-        base_domain = get_base_domain(url)
-        
-        # Early removal of all images if exclude_all_images is set
-        # This happens before any processing to minimize memory usage
-        if kwargs.get("exclude_all_images", False):
-            for img in body.find_all('img'):
-                img.decompose()
-
-        try:
-            meta = extract_metadata("", soup)
-        except Exception as e:
-            self._log(
-                "error",
-                message="Error extracting metadata: {error}",
-                tag="SCRAPE",
-                params={"error": str(e)},
-            )
-            meta = {}
-
-        # Handle tag-based removal first - faster than CSS selection
-        excluded_tags = set(kwargs.get("excluded_tags", []) or [])
-        if excluded_tags:
-            for element in body.find_all(lambda tag: tag.name in excluded_tags):
-                element.extract()
-
-        # Handle CSS selector-based removal
-        excluded_selector = kwargs.get("excluded_selector", "")
-        if excluded_selector:
-            is_single_selector = (
-                "," not in excluded_selector and " " not in excluded_selector
-            )
-            if is_single_selector:
-                while element := body.select_one(excluded_selector):
-                    element.extract()
-            else:
-                for element in body.select(excluded_selector):
-                    element.extract()
-
+        soup = None
+        body = None
         content_element = None
-        if target_elements:
-            try:
-                for_content_targeted_element = []
-                for target_element in target_elements:
-                    for_content_targeted_element.extend(body.select(target_element))
-                content_element = soup.new_tag("div")
-                for el in for_content_targeted_element:
-                    content_element.append(copy.deepcopy(el))
-            except Exception as e:
-                self._log("error", f"Error with target element detection: {str(e)}", "SCRAPE")
-                return None
-        else:
-            content_element = body     
+        error_body = None
 
-        kwargs["exclude_social_media_domains"] = set(
-            kwargs.get("exclude_social_media_domains", []) + SOCIAL_MEDIA_DOMAINS
-        )
-        kwargs["exclude_domains"] = set(kwargs.get("exclude_domains", []))
-        if kwargs.get("exclude_social_media_links", False):
-            kwargs["exclude_domains"] = kwargs["exclude_domains"].union(
-                kwargs["exclude_social_media_domains"]
-            )
-
-        result_obj = self.process_element(
-            url,
-            body,
-            word_count_threshold=word_count_threshold,
-            base_domain=base_domain,
-            **kwargs,
-        )
-
-        links = {"internal": [], "external": []}
-        media = result_obj["media"]
-        internal_links_dict = result_obj["internal_links_dict"]
-        external_links_dict = result_obj["external_links_dict"]
-
-        # Update the links dictionary with unique links
-        links["internal"] = list(internal_links_dict.values())
-        links["external"] = list(external_links_dict.values())
-
-        # # Process images using ThreadPoolExecutor
-        imgs = body.find_all("img")
-
-        media["images"] = [
-            img
-            for result in (
-                self.process_image(img, url, i, len(imgs), **kwargs)
-                for i, img in enumerate(imgs)
-            )
-            if result is not None
-            for img in result
-        ]
-        
-        # Process tables if not excluded
-        excluded_tags = set(kwargs.get("excluded_tags", []) or [])
-        if 'table' not in excluded_tags:
-            tables = body.find_all('table')
-            for table in tables:
-                if self.is_data_table(table, **kwargs):
-                    table_data = self.extract_table_data(table)
-                    media["tables"].append(table_data)
-
-        body = self.flatten_nested_elements(body)
-        base64_pattern = re.compile(r'data:image/[^;]+;base64,([^"]+)')
-        for img in imgs:
-            src = img.get("src", "")
-            if base64_pattern.match(src):
-                # Replace base64 data with empty string
-                img["src"] = base64_pattern.sub("", src)
-
-        str_body = ""
         try:
-            str_body = content_element.encode_contents().decode("utf-8")
-        except Exception:
-            # Reset body to the original HTML
-            success = False
-            body = BeautifulSoup(html, "html.parser")
+            soup = BeautifulSoup(html, parser_type)
+            body = soup.body
+            if body is None:
+                raise Exception("'<body>' tag is not found in fetched html. Consider adding wait_for=\"css:body\" to wait for body tag to be loaded into DOM.")
+            base_domain = get_base_domain(url)
 
-            # Create a new div with a special ID
-            error_div = body.new_tag("div", id="crawl4ai_error_message")
-            error_div.string = """
-            Crawl4AI Error: This page is not fully supported.
-            
-            Possible reasons:
-            1. The page may have restrictions that prevent crawling.
-            2. The page might not be fully loaded.
-            
-            Suggestions:
-            - Try calling the crawl function with these parameters:
-            magic=True,
-            - Set headless=False to visualize what's happening on the page.
-            
-            If the issue persists, please check the page's structure and any potential anti-crawling measures.
-            """
+            # Early removal of all images if exclude_all_images is set
+            # This happens before any processing to minimize memory usage
+            if kwargs.get("exclude_all_images", False):
+                for img in body.find_all('img'):
+                    img.decompose()
 
-            # Append the error div to the body
-            body.append(error_div)
-            str_body = body.encode_contents().decode("utf-8")
+            try:
+                meta = extract_metadata("", soup)
+            except Exception as e:
+                self._log(
+                    "error",
+                    message="Error extracting metadata: {error}",
+                    tag="SCRAPE",
+                    params={"error": str(e)},
+                )
+                meta = {}
 
-            print(
-                "[LOG] 😧 Error: After processing the crawled HTML and removing irrelevant tags, nothing was left in the page. Check the markdown for further details."
+            # Handle tag-based removal first - faster than CSS selection
+            excluded_tags = set(kwargs.get("excluded_tags", []) or [])
+            if excluded_tags:
+                for element in body.find_all(lambda tag: tag.name in excluded_tags):
+                    element.extract()
+
+            # Handle CSS selector-based removal
+            excluded_selector = kwargs.get("excluded_selector", "")
+            if excluded_selector:
+                is_single_selector = (
+                    "," not in excluded_selector and " " not in excluded_selector
+                )
+                if is_single_selector:
+                    while element := body.select_one(excluded_selector):
+                        element.extract()
+                else:
+                    for element in body.select(excluded_selector):
+                        element.extract()
+
+            if target_elements:
+                try:
+                    for_content_targeted_element = []
+                    for target_element in target_elements:
+                        for_content_targeted_element.extend(body.select(target_element))
+                    content_element = soup.new_tag("div")
+                    for el in for_content_targeted_element:
+                        content_element.append(copy.deepcopy(el))
+                except Exception as e:
+                    self._log("error", f"Error with target element detection: {str(e)}", "SCRAPE")
+                    return None
+            else:
+                content_element = body     
+
+            kwargs["exclude_social_media_domains"] = set(
+                kwargs.get("exclude_social_media_domains", []) + SOCIAL_MEDIA_DOMAINS
             )
-            self._log(
-                "error",
-                message="After processing the crawled HTML and removing irrelevant tags, nothing was left in the page. Check the markdown for further details.",
-                tag="SCRAPE",
+            kwargs["exclude_domains"] = set(kwargs.get("exclude_domains", []))
+            if kwargs.get("exclude_social_media_links", False):
+                kwargs["exclude_domains"] = kwargs["exclude_domains"].union(
+                    kwargs["exclude_social_media_domains"]
+                )
+
+            result_obj = self.process_element(
+                url,
+                body,
+                word_count_threshold=word_count_threshold,
+                base_domain=base_domain,
+                **kwargs,
             )
 
-        cleaned_html = str_body.replace("\n\n", "\n").replace("  ", " ")
+            links = {"internal": [], "external": []}
+            media = result_obj["media"]
+            internal_links_dict = result_obj["internal_links_dict"]
+            external_links_dict = result_obj["external_links_dict"]
 
-        return {
-            "cleaned_html": cleaned_html,
-            "success": success,
-            "media": media,
-            "links": links,
-            "metadata": meta,
-        }
+            # Update the links dictionary with unique links
+            links["internal"] = list(internal_links_dict.values())
+            links["external"] = list(external_links_dict.values())
+
+            # # Process images using ThreadPoolExecutor
+            imgs = body.find_all("img")
+
+            media["images"] = [
+                img
+                for result in (
+                    self.process_image(img, url, i, len(imgs), **kwargs)
+                    for i, img in enumerate(imgs)
+                )
+                if result is not None
+                for img in result
+            ]
+
+            # Process tables if not excluded
+            excluded_tags = set(kwargs.get("excluded_tags", []) or [])
+            if 'table' not in excluded_tags:
+                tables = body.find_all('table')
+                for table in tables:
+                    if self.is_data_table(table, **kwargs):
+                        table_data = self.extract_table_data(table)
+                        media["tables"].append(table_data)
+
+            body = self.flatten_nested_elements(body)
+            base64_pattern = re.compile(r'data:image/[^;]+;base64,([^"]+)')
+            for img in imgs:
+                src = img.get("src", "")
+                if base64_pattern.match(src):
+                    # Replace base64 data with empty string
+                    img["src"] = base64_pattern.sub("", src)
+
+            str_body = ""
+            try:
+                str_body = content_element.encode_contents().decode("utf-8")
+            except Exception:
+                # Reset body to the original HTML
+                success = False
+                error_body = BeautifulSoup(html, "html.parser")
+
+                # Create a new div with a special ID
+                error_div = error_body.new_tag("div", id="crawl4ai_error_message")
+                error_div.string = """
+                Crawl4AI Error: This page is not fully supported.
+                
+                Possible reasons:
+                1. The page may have restrictions that prevent crawling.
+                2. The page might not be fully loaded.
+                
+                Suggestions:
+                - Try calling the crawl function with these parameters:
+                magic=True,
+                - Set headless=False to visualize what's happening on the page.
+                
+                If the issue persists, please check the page's structure and any potential anti-crawling measures.
+                """
+
+                # Append the error div to the body
+                error_body.append(error_div)
+                str_body = error_body.encode_contents().decode("utf-8")
+
+                print(
+                    "[LOG] 😧 Error: After processing the crawled HTML and removing irrelevant tags, nothing was left in the page. Check the markdown for further details."
+                )
+                self._log(
+                    "error",
+                    message="After processing the crawled HTML and removing irrelevant tags, nothing was left in the page. Check the markdown for further details.",
+                    tag="SCRAPE",
+                )
+
+            cleaned_html = str_body.replace("\n\n", "\n").replace("  ", " ")
+
+            return {
+                "cleaned_html": cleaned_html,
+                "success": success,
+                "media": media,
+                "links": links,
+                "metadata": meta,
+            }
+
+        finally:
+            # Explicitly clean up BeautifulSoup objects to release memory
+            try:
+                if soup:
+                    soup.decompose()
+                    del soup
+                if error_body:
+                    error_body.decompose()
+                    del error_body
+                if content_element and content_element != body:
+                    # If content_element is created independently, also clean it up
+                    content_element.decompose()
+                    del content_element
+                if body:
+                    del body
+            except Exception as e:
+                # Record errors during cleanup but don't affect main flow
+                if self.logger:
+                    self._log(
+                        "warning",
+                        message="Error during BeautifulSoup cleanup: {error}",
+                        tag="CLEANUP",
+                        params={"error": str(e)},
+                    )
 
 
 class LXMLWebScrapingStrategy(WebScrapingStrategy):
@@ -1390,7 +1421,7 @@ class LXMLWebScrapingStrategy(WebScrapingStrategy):
             return False
         col_counts = [len(row.xpath(".//td|.//th")) for row in rows]
         avg_cols = sum(col_counts) / len(col_counts)
-        variance = sum((c - avg_cols)**2 for c in col_counts) / len(col_counts)
+        variance = sum((c - avg_cols) ** 2 for c in col_counts) / len(col_counts)
         if variance < 1:
             score += 2
 
@@ -1401,7 +1432,11 @@ class LXMLWebScrapingStrategy(WebScrapingStrategy):
             score += 1
 
         # Text density
-        total_text = sum(len(''.join(cell.itertext()).strip()) for row in rows for cell in row.xpath(".//td|.//th"))
+        total_text = sum(
+            len("".join(cell.itertext()).strip())
+            for row in rows
+            for cell in row.xpath(".//td|.//th")
+        )
         total_tags = sum(1 for _ in table.iterdescendants())
         text_ratio = total_text / (total_tags + 1e-5)
         if text_ratio > 20:
@@ -1410,7 +1445,7 @@ class LXMLWebScrapingStrategy(WebScrapingStrategy):
             score += 2
 
         # Data attributes
-        data_attrs = sum(1 for attr in table.attrib if attr.startswith('data-'))
+        data_attrs = sum(1 for attr in table.attrib if attr.startswith("data-"))
         score += data_attrs * 0.5
 
         # Size check
@@ -1454,10 +1489,12 @@ class LXMLWebScrapingStrategy(WebScrapingStrategy):
                 rows.append(row_data)
 
         # Align rows with headers
-        max_columns = len(headers) if headers else (max(len(row) for row in rows) if rows else 0)
+        max_columns = (
+            len(headers) if headers else (max(len(row) for row in rows) if rows else 0)
+        )
         aligned_rows = []
         for row in rows:
-            aligned = row[:max_columns] + [''] * (max_columns - len(row))
+            aligned = row[:max_columns] + [""] * (max_columns - len(row))
             aligned_rows.append(aligned)
 
         if not headers:
@@ -1490,11 +1527,11 @@ class LXMLWebScrapingStrategy(WebScrapingStrategy):
             body = doc
 
             base_domain = get_base_domain(url)
-            
+
             # Early removal of all images if exclude_all_images is set
             # This is more efficient in lxml as we remove elements before any processing
             if kwargs.get("exclude_all_images", False):
-                for img in body.xpath('//img'):
+                for img in body.xpath("//img"):
                     if img.getparent() is not None:
                         img.getparent().remove(img)
 
@@ -1538,11 +1575,17 @@ class LXMLWebScrapingStrategy(WebScrapingStrategy):
                 try:
                     for_content_targeted_element = []
                     for target_element in target_elements:
-                        for_content_targeted_element.extend(body.cssselect(target_element))
+                        for_content_targeted_element.extend(
+                            body.cssselect(target_element)
+                        )
                     content_element = lhtml.Element("div")
                     content_element.extend(copy.deepcopy(for_content_targeted_element))
                 except Exception as e:
-                    self._log("error", f"Error with target element detection: {str(e)}", "SCRAPE")
+                    self._log(
+                        "error",
+                        f"Error with target element detection: {str(e)}",
+                        "SCRAPE",
+                    )
                     return None
             else:
                 content_element = body
@@ -1583,7 +1626,7 @@ class LXMLWebScrapingStrategy(WebScrapingStrategy):
                 **kwargs,
             )
 
-            if 'table' not in excluded_tags:
+            if "table" not in excluded_tags:
                 tables = body.xpath(".//table")
                 for table in tables:
                     if self.is_data_table(table, **kwargs):
@@ -1616,7 +1659,7 @@ class LXMLWebScrapingStrategy(WebScrapingStrategy):
 
             # Generate output HTML
             cleaned_html = lhtml.tostring(
-                # body,   
+                # body,
                 content_element,
                 encoding="unicode",
                 pretty_print=True,
@@ -1662,12 +1705,7 @@ class LXMLWebScrapingStrategy(WebScrapingStrategy):
             return {
                 "cleaned_html": cleaned_html,
                 "success": False,
-                "media": {
-                    "images": [],
-                    "videos": [],
-                    "audios": [],
-                    "tables": []
-                },
+                "media": {"images": [], "videos": [], "audios": [], "tables": []},
                 "links": {"internal": [], "external": []},
                 "metadata": {},
             }
